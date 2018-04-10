@@ -68,6 +68,9 @@ int verbose = 1;
 const char *ipaddr;
 const char *netmask;
 int slipfd = 0;
+int tap = 0;
+int bridge = 0;
+unsigned char tap_mac[6] = {0,0,0,0,0,0};
 uint16_t basedelay=0,delaymsec=0;
 uint32_t startsec,startmsec,delaystartsec,delaystartmsec;
 int timestamp = 0, flowcontrol=0, showprogress=0, flowcontrol_xonxoff=0;
@@ -262,6 +265,34 @@ serial_to_tun(FILE *inslip, int outfd)
           fwrite(uip.inbuf, inbufptr, 1, stdout);
         }
       } else {
+        if(tap){
+          unsigned int crc = 0xFFFFFFFF, byte, mask;
+	  for(int i = inbufptr -1; i >= 0; i--){
+	    uip.inbuf[i+14] = uip.inbuf[i];
+	  }
+	  inbufptr += 14;
+	  memcpy(uip.inbuf, tap_mac, 6);
+	  unsigned char node1_mac[6] = {0,1,0,1,0,1};
+	  memcpy(uip.inbuf + 6, node1_mac, 6);
+	  unsigned char flags[2] = {0x86,0xdd};
+	  memcpy(uip.inbuf + 12, flags, 2);
+	  for(int i = 0; i < inbufptr; i++){
+            byte = uip.inbuf[i];
+	    crc = crc ^ byte;
+	    for(int j = 7; j>=0; j--){
+	      mask = -(crc & 1);
+	      crc = (crc >> 1) ^ (0xEDB88320 & mask);
+	    }
+          }
+	  crc=~crc;
+	  inbufptr += 4;
+	  unsigned char crc32[4];
+	  crc32[3] = (crc >> 24);
+	  crc32[2] = (crc >> 16) & 0xFF;
+	  crc32[1] = (crc >> 8) & 0xFF;
+	  crc32[0] = crc & 0xFF;
+	  memcpy(uip.inbuf + inbufptr - 4, crc32, 4);
+	}
         if(verbose>2) {
           if (timestamp) stamptime();
           printf("Packet from SLIP of length %d - write TUN\n", inbufptr);
@@ -443,7 +474,9 @@ write_to_serial(int outfd, void *inbuf, int len)
    */
   /* slip_send(outfd, SLIP_END); */
 
+
   for(i = 0; i < len; i++) {
+    if(tap && i < 14) continue;
     switch(p[i]) {
     case SLIP_END:
       slip_send(outfd, SLIP_ESC);
@@ -666,7 +699,7 @@ ifconf(const char *tundev, const char *ipaddr)
   if (timestamp) stamptime();
   ssystem("ifconfig %s inet `hostname` mtu %d up", tundev, devmtu);
   if (timestamp) stamptime();
-  ssystem("ifconfig %s add %s", tundev, ipaddr);
+  if (!bridge) ssystem("ifconfig %s add %s", tundev, ipaddr);
 
 /* radvd needs a link local address for routing */
 #if 0
@@ -711,7 +744,8 @@ ifconf(const char *tundev, const char *ipaddr)
     }
     sprintf(lladdr,"fe80::%x:%x:%x:%x",a[1]&0xfefd,a[2],a[3],a[7]);
     if (timestamp) stamptime();
-    ssystem("ifconfig %s add %s/64", tundev, lladdr);
+    if (!bridge) ssystem("ifconfig %s add %s/64", tundev, lladdr);
+    if (bridge) ssystem("ifconfig %s 0.0.0.0",tundev);
   }
 #endif /* link local */
 #elif defined(__APPLE__)
@@ -755,15 +789,15 @@ main(int argc, char **argv)
   const char *host = NULL;
   const char *port = NULL;
   const char *prog;
+  char* mac_aux;
   int baudrate = -2;
   int ipa_enable = 0;
-  int tap = 0;
   slipfd = 0;
 
   prog = argv[0];
   setvbuf(stdout, NULL, _IOLBF, 0); /* Line buffered output. */
 
-  while((c = getopt(argc, argv, "B:HILPhXM:s:t:v::d::a:p:T")) != -1) {
+  while((c = getopt(argc, argv, "B:HILPhXM:s:t:v::d::a:p:Tm:b")) != -1) {
     switch(c) {
     case 'B':
       baudrate = atoi(optarg);
@@ -833,6 +867,16 @@ main(int argc, char **argv)
     case 'T':
       tap = 1;
       break;
+    case 'm':
+      mac_aux = optarg;
+      for (int i = 0; i < sizeof(tap_mac); i++){
+        tap_mac[i] = strtoul(mac_aux,&mac_aux,16);
+	mac_aux++;
+      }
+      break;
+    case 'b':
+      bridge = 1;
+      break;
 
     case '?':
     case 'h':
@@ -873,7 +917,7 @@ exit(1);
   argc -= (optind - 1);
   argv += (optind - 1);
 
-  if(argc != 2 && argc != 3) {
+  if(argc != 2 && argc != 3 ) {
     err(1, "usage: %s [-B baudrate] [-H] [-L] [-s siodev] [-t tundev] [-T] [-v verbosity] [-d delay] [-a serveraddress] [-p serverport] ipaddress", prog);
   }
   ipaddr = argv[1];
